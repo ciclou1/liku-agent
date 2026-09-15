@@ -14,3 +14,4 @@ coverage.xml
 htmlcov/
 .coverage
 *.zip
+.test-tmp*/
