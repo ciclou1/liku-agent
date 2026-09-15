@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+markers = ["performance: benchmark tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,35 @@
+groups:
+  - name: liku-api
+    rules:
+      - alert: LikuApiDown
+        expr: up{job="liku-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "平衡利库 API 不可用"
+          description: "Prometheus 连续 2 分钟无法抓取 API 指标。"
+      - alert: LikuDatabaseNotReady
+        expr: liku_database_ready{database="primary"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "平衡利库数据库未就绪"
+          description: "应用无法连接主数据库。"
+      - alert: LikuRedisNotReady
+        expr: liku_redis_ready{redis="broker"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "平衡利库 Redis 未就绪"
+          description: "应用任务 broker/backend 依赖不可用。"
+      - alert: LikuHighErrorRate
+        expr: sum(rate(liku_http_requests_total{status=~"5.."}[5m])) / sum(rate(liku_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "平衡利库 API 5xx 比例过高"
+          description: "最近 5 分钟 HTTP 5xx 比例超过 5%。"

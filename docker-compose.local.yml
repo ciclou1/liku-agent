@@ -1,0 +1,150 @@
+services:
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    image: agent-backend:latest
+    env_file:
+      - .env
+    environment:
+      APP_ENV: local-demo
+      DATABASE_URL: sqlite+aiosqlite:///./storage/demo-host.db
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /app/storage
+      PYTHONPATH: /app/backend
+      DEMO_SEED: "false"
+      # Docker Desktop 无法直接路由到 ERP 的 172.20.0.0/22 网段；
+      # Windows 宿主机配置 13306 -> 172.20.0.114:3306 的端口转发后，容器经此地址访问 ERP。
+      ERP_DB_HOST: ${ERP_PROXY_HOST:-host.docker.internal}
+      ERP_DB_PORT: ${ERP_PROXY_PORT:-13306}
+    ports:
+      - "${API_PORT:-18000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/ready', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    entrypoint: []
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir /app/backend
+
+  worker:
+    image: agent-worker:latest
+    env_file:
+      - .env
+    environment:
+      APP_ENV: local-demo
+      DATABASE_URL: sqlite+aiosqlite:///./storage/demo.db
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /app/storage
+      PYTHONPATH: /app/backend
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    entrypoint: []
+    command: celery -A app.celery_app.celery_app worker --loglevel=INFO
+
+  beat:
+    image: agent-beat:latest
+    env_file:
+      - .env
+    environment:
+      APP_ENV: local-demo
+      DATABASE_URL: sqlite+aiosqlite:///./storage/demo.db
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /app/storage
+      PYTHONPATH: /app/backend
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    entrypoint: []
+    command: celery -A app.celery_app.celery_app beat --loglevel=INFO
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      # 本地 ERP 联调时后端运行在 Windows 宿主机，避免 Docker Desktop 无法路由 ERP 网段。
+      VITE_API_BASE_URL: http://localhost:${HOST_API_PORT:-18001}/api/v1
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: npm run dev -- --host 0.0.0.0
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    profiles: [monitoring]
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.local.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    profiles: [monitoring]
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.1.1}
+    profiles: [monitoring]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+
+volumes:
+  frontend_node_modules:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

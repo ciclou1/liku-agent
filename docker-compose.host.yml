@@ -1,0 +1,9 @@
+services:
+  backend:
+    ports: !override
+      - "${API_PORT:-18000}:8000"
+  frontend:
+    environment:
+      VITE_API_BASE_URL: http://localhost:${API_PORT:-18000}/api/v1
+    ports: !override
+      - "${FRONTEND_PORT:-5173}:5173"

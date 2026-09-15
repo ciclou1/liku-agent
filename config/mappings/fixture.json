@@ -1,0 +1,17 @@
+{
+  "materials": {
+    "material_code": "sku",
+    "material_name": "name",
+    "material_category": "category",
+    "uom": "unit",
+    "min_package": "package_size"
+  },
+  "inventory_snapshots": {
+    "material_code": "sku",
+    "warehouse": "warehouse_id",
+    "available": "available_quantity",
+    "in_transit": "in_transit_quantity",
+    "cost": "unit_cost"
+  }
+}
+

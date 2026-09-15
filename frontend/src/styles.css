@@ -1,0 +1,24 @@
+:root { font-family: Inter, "Microsoft YaHei", sans-serif; color: #16212b; background: #f4f6f8; }
+.database-source-modal .ant-modal-title { font-size: 26px; font-weight: 500; }
+.database-source-modal .ant-modal-body { padding-top: 26px; }
+.database-source-modal .ant-form-item { margin-bottom: 26px; }
+.database-source-modal .ant-form-item-label > label { font-size: 20px; color: #62666d; }
+.database-source-modal .ant-input, .database-source-modal .ant-select, .database-source-modal .ant-input-number, .database-source-modal .ant-input-affix-wrapper { font-size: 20px; }
+.database-source-modal .ant-modal-footer { padding-top: 8px; }
+.database-source-modal .ant-modal-footer .ant-btn { height: 48px; font-size: 20px; }
+.database-driver-note { background: #f4f4f5; color: #8b9099; padding: 16px 22px; border-radius: 6px; font-size: 18px; }
+@media (max-width: 600px) { .database-source-modal .ant-form-item { display: block; } .database-source-modal .ant-form-item-label { text-align: left; } }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+.app-sider { background: #102a43 !important; }
+.brand { height: 64px; display: flex; align-items: center; justify-content: center; color: #f7fafc; font-weight: 700; letter-spacing: 0; }
+.app-header { display: flex; justify-content: space-between; align-items: center; padding: 0 24px; background: #fff; border-bottom: 1px solid #e6e9ed; }
+.collapse-button { border: 0; background: transparent; font-size: 18px; cursor: pointer; color: #34495e; }
+.app-content { padding: 28px; max-width: 1600px; width: 100%; margin: 0 auto; }
+.result-box { margin-top: 20px; padding: 16px; background: #f7f9fb; border: 1px solid #e6e9ed; overflow: auto; }
+.login-page { min-height: 100vh; display: grid; place-items: center; background: #f4f6f8; }
+.login-panel { width: min(380px, calc(100vw - 32px)); padding: 32px; background: #fff; border: 1px solid #e6e9ed; box-shadow: 0 8px 24px rgba(16, 42, 67, 0.08); }
+.login-panel input { height: 36px; border: 1px solid #d9dfe5; padding: 0 10px; }
+.transfer-map { display: grid; gap: 14px; min-height: 260px; align-content: start; padding: 24px; background: #f7f9fb; }
+.transfer-line { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+@media (max-width: 768px) { .app-content { padding: 16px; } .app-header { padding: 0 16px; } }

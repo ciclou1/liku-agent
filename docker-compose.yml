@@ -1,0 +1,160 @@
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    environment:
+      MYSQL_DATABASE: liku
+      MYSQL_USER: liku
+      MYSQL_PASSWORD: liku
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql+aiomysql://liku:liku@mysql:3306/liku}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      STORAGE_PATH: /app/storage
+      PYTHONPATH: /app/backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+      - ./tests:/app/tests
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/ready', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --app-dir /app/backend
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql+aiomysql://liku:liku@mysql:3306/liku}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      STORAGE_PATH: /app/storage
+      PYTHONPATH: /app/backend
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+    depends_on:
+      backend:
+        condition: service_healthy
+      mysql:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    entrypoint: []
+    command: celery -A app.celery_app.celery_app worker --loglevel=INFO
+
+  beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql+aiomysql://liku:liku@mysql:3306/liku}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      STORAGE_PATH: /app/storage
+      PYTHONPATH: /app/backend
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+    depends_on:
+      backend:
+        condition: service_healthy
+      mysql:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    entrypoint: []
+    command: celery -A app.celery_app.celery_app beat --loglevel=INFO
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    # 生产构建（nginx）：代码打包进镜像，无挂载一致性问题；改前端代码后需 rebuild
+    ports:
+      - "5173:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - backend
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.5.0}
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - backend
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.1.1}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  mysql_data:
+  frontend_node_modules:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

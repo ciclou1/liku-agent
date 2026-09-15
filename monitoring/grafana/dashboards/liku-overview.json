@@ -1,0 +1,16 @@
+{
+  "title": "平衡利库运行概览",
+  "uid": "liku-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {"id": 1, "type": "stat", "title": "API 可用性", "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}, "targets": [{"expr": "up{job=\"liku-api\"}", "legendFormat": "API"}]},
+    {"id": 2, "type": "stat", "title": "数据库就绪", "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}, "targets": [{"expr": "liku_database_ready{database=\"primary\"}", "legendFormat": "数据库"}]},
+    {"id": 3, "type": "timeseries", "title": "请求速率", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}, "targets": [{"expr": "sum(rate(liku_http_requests_total[5m]))", "legendFormat": "requests/s"}]},
+    {"id": 4, "type": "timeseries", "title": "P95 延迟", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}, "targets": [{"expr": "histogram_quantile(0.95, sum(rate(liku_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95"}]},
+    {"id": 5, "type": "timeseries", "title": "HTTP 5xx 速率", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}, "targets": [{"expr": "sum(rate(liku_http_requests_total{status=~\"5..\"}[5m]))", "legendFormat": "5xx/s"}]},
+    {"id": 6, "type": "timeseries", "title": "活动请求数", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}, "targets": [{"expr": "liku_http_active_requests", "legendFormat": "active"}]}
+  ]
+}
