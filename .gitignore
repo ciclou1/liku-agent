@@ -9,6 +9,10 @@ __pycache__/
 node_modules/
 frontend/dist/
 /storage/
+# 本地运行库（含从 ERP 同步的业务数据，不入版本库）
+backend/storage/
+# 一次性排查脚本
+_audit_*.py
 *.log
 coverage.xml
 htmlcov/

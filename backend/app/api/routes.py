@@ -36,6 +36,8 @@ from app.data.dictionary import required_fields
 from app.services.governance import DataGovernanceService
 from app.services.im import ImService
 from app.services.domain import DatabaseDomainService
+from app.services.dormant import DormantService
+from app.services.replenishment import ReplenishmentService
 from app.services.narrative import NarrativeService
 from app.services.persistence import PersistenceService
 from app.services.audit_persistence import AuditPersistenceService
@@ -63,6 +65,8 @@ user_service = UserService(hash_password)
 governance_service = DataGovernanceService()
 im_service = ImService(warning_service, inventory_service)
 database_domain_service = DatabaseDomainService()
+dormant_service = DormantService()
+replenishment_service = ReplenishmentService()
 persistence_service = PersistenceService()
 audit_persistence_service = AuditPersistenceService()
 narrative_service = NarrativeService()
@@ -304,6 +308,99 @@ async def transfers(sku: str | None = Query(default=None), target_warehouse_id: 
 @router.post("/transfers/generate", response_model=ApiResponse[list[dict]], dependencies=[Depends(current_access)])
 async def generate_transfers(payload: TransferPlanningRequest, session: AsyncSession = Depends(get_db)) -> ApiResponse[list[dict]]:
     return ApiResponse(data=await database_domain_service.transfers(session, payload.sku, payload.target_warehouse_id, payload.min_quantity))
+
+
+# ── 呆滞库存识别 ──
+
+@router.get("/dormant", response_model=ApiResponse[dict], dependencies=[Depends(current_access)])
+async def dormant_list(threshold_days: int = Query(default=365, ge=30, le=1825),
+                       warehouse_id: str | None = Query(default=None, max_length=80),
+                       page: int = Query(default=1, ge=1), size: int = Query(default=50, ge=1, le=200),
+                       session: AsyncSession = Depends(get_db)) -> ApiResponse[dict]:
+    """长期无消耗物资清单 + 处置建议（调剂→退货→报废优先级）。"""
+    return ApiResponse(data=await dormant_service.list_dormant(
+        session, threshold_days=threshold_days, warehouse_id=warehouse_id, page=page, size=size))
+
+
+@router.get("/dormant/export", dependencies=[Depends(current_access)])
+async def dormant_export(threshold_days: int = Query(default=365, ge=30, le=1825),
+                         warehouse_id: str | None = Query(default=None, max_length=80),
+                         session: AsyncSession = Depends(get_db)):
+    """呆滞清单导出（xlsx）。"""
+    import io
+    from datetime import datetime
+
+    from openpyxl import Workbook
+
+    result = await dormant_service.list_dormant(session, threshold_days=threshold_days,
+                                                warehouse_id=warehouse_id, page=1, size=10000)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "呆滞库存清单"
+    ws.append(["物料编码", "名称", "仓库", "可用量", "单位", "单价", "占用金额", "最近领用", "呆滞天数", "处置建议", "依据"])
+    for item in result["items"]:
+        ws.append([item["sku"], item["name"], item["warehouse_name"], item["available_quantity"], item["unit"],
+                   item["unit_cost"], item["amount"], item["last_used_at"] or "从未领用",
+                   item["days_idle"] if item["days_idle"] is not None else "-", item["suggestion"], item["basis"]])
+    ws.append([])
+    ws.append(["合计", result["total"], "项", "金额", result["page_amount"]])
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    filename = f"dormant-stock-{datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
+    return Response(content=buffer.getvalue(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+# ── 安全库存优化 ──
+
+@router.get("/replenishment", response_model=ApiResponse[dict], dependencies=[Depends(current_access)])
+async def replenishment_batch(warehouse_id: str | None = Query(default=None, max_length=80),
+                              limit: int = Query(default=100, ge=1, le=500),
+                              session: AsyncSession = Depends(get_db)) -> ApiResponse[dict]:
+    """批量补货建议：近 12 月有消耗的 SKU 按月均消耗 Top N（交期取默认值）。"""
+    return ApiResponse(data=await replenishment_service.batch(session, warehouse_id=warehouse_id, limit=limit))
+
+
+@router.get("/replenishment/export", dependencies=[Depends(current_access)])
+async def replenishment_export(warehouse_id: str | None = Query(default=None, max_length=80),
+                               limit: int = Query(default=100, ge=1, le=500),
+                               session: AsyncSession = Depends(get_db)):
+    """批量补货建议导出（xlsx）。"""
+    import io
+    from datetime import datetime
+
+    from openpyxl import Workbook
+
+    result = await replenishment_service.batch(session, warehouse_id=warehouse_id, limit=limit)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "安全库存优化建议"
+    ws.append(["物料编码", "名称", "月均消耗", "月消耗波动", "当前安全库存", "建议安全库存", "安全库存缺口", "补货点", "建议补货量"])
+    for item in result["items"]:
+        ws.append([item["sku"], item["name"], item["mu_monthly"], item["sigma_monthly"],
+                   item["current_safety"], item["suggested_safety"], item["safety_gap"],
+                   item["reorder_point"], item["reorder_quantity"]])
+    ws.append([])
+    ws.append(["口径", result.get("note", "")])
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    filename = f"replenishment-{datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
+    return Response(content=buffer.getvalue(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+@router.get("/replenishment/{sku}", response_model=ApiResponse[dict], dependencies=[Depends(current_access)])
+async def replenishment_detail(sku: str,
+                               warehouse_id: str | None = Query(default=None, max_length=80),
+                               coverage_months: float = Query(default=3, ge=0.5, le=12),
+                               lead_time_months: float | None = Query(default=None, gt=0, le=24),
+                               session: AsyncSession = Depends(get_db)) -> ApiResponse[dict]:
+    """单物资补货建议：消耗速率 + 交期（默认 ERP 实测，可手动覆盖）→ 补货点/补货量。"""
+    return ApiResponse(data=await replenishment_service.optimize(
+        session, sku, warehouse_id=warehouse_id, coverage_months=coverage_months,
+        lead_time_months=lead_time_months))
 
 
 @router.get("/prices/{sku}", response_model=ApiResponse[PriceResponse], dependencies=[Depends(current_access)])

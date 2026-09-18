@@ -72,6 +72,11 @@ class PurchaseResponse(BaseModel):
     model_name: str | None = None
     forecast_demand: float | None = None
     data_source: str | None = None
+    # 采购建议的库存口径：库存、在途、预留、可用量统一返回，供工作台明细展示。
+    available_stock: float | None = None
+    in_transit: float | None = None
+    safety_stock: float | None = None
+    package_size: float | None = None
     inventory_quantity: float | None = None
     reserved_quantity: float | None = None
     available_quantity: float | None = None

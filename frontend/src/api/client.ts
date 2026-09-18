@@ -1,4 +1,4 @@
-import type { ApiResponse, ForecastData, InventoryItem, MaterialOption, PriceData, WarningItem } from "../types/domain";
+import type { ApiResponse, DormantResponse, ForecastData, InventoryItem, MaterialOption, PriceData, ReplenishmentBatch, ReplenishmentDetail, WarningItem } from "../types/domain";
 
 // 默认走同源 /api（vite 代理到后端），本机/内网 IP 访问均自动正确；可用 VITE_API_BASE_URL 覆盖
 const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
@@ -56,6 +56,31 @@ export const api = {
   pushRecommendation: (id: string) => request<Record<string, unknown>>(`/purchase-recommendations/${id}/push`, { method: "POST" }),
   exportRecommendations: () => fetch(`${baseUrl}/purchase-recommendations/export`, { headers: { Authorization: `Bearer ${localStorage.getItem("liku_token") ?? ""}` } }),
   chat: (message: string, sessionId?: string) => request<{ session_id: string; answer: string; sources: string[] }>("/chat", { method: "POST", body: JSON.stringify({ message, session_id: sessionId }) }),
+  dormant: (params: { threshold_days?: number; warehouse_id?: string; page?: number; size?: number }) => {
+    const query = new URLSearchParams();
+    if (params.threshold_days) query.set("threshold_days", String(params.threshold_days));
+    if (params.warehouse_id) query.set("warehouse_id", params.warehouse_id);
+    if (params.page) query.set("page", String(params.page));
+    if (params.size) query.set("size", String(params.size));
+    return request<DormantResponse>(`/dormant?${query.toString()}`);
+  },
+  dormantExport: () => fetch(`${baseUrl}/dormant/export`, { headers: { Authorization: `Bearer ${localStorage.getItem("liku_token") ?? ""}` } }),
+  replenishmentDetail: (sku: string, params?: { warehouse_id?: string; coverage_months?: number; lead_time_months?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.warehouse_id) query.set("warehouse_id", params.warehouse_id);
+    if (params?.coverage_months) query.set("coverage_months", String(params.coverage_months));
+    if (params?.lead_time_months) query.set("lead_time_months", String(params.lead_time_months));
+    const suffix = query.toString();
+    return request<ReplenishmentDetail>(`/replenishment/${encodeURIComponent(sku)}${suffix ? `?${suffix}` : ""}`);
+  },
+  replenishmentBatch: (params?: { warehouse_id?: string; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.warehouse_id) query.set("warehouse_id", params.warehouse_id);
+    if (params?.limit) query.set("limit", String(params.limit));
+    const suffix = query.toString();
+    return request<ReplenishmentBatch>(`/replenishment${suffix ? `?${suffix}` : ""}`);
+  },
+  replenishmentExport: () => fetch(`${baseUrl}/replenishment/export`, { headers: { Authorization: `Bearer ${localStorage.getItem("liku_token") ?? ""}` } }),
 };
 
 export interface DatabaseSource {

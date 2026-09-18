@@ -57,14 +57,18 @@ def _datestr(value) -> date:
 
 
 def run_sync() -> None:
-    """同步入口（在后台线程执行；数据库写入经 asyncio.run 驱动异步会话）。"""
+    """同步入口（在后台线程执行；数据库写入经 asyncio.run 驱动异步会话）。
+
+    同步跑在独立事件循环里，与请求主循环共用的全局引擎连接池会把旧循环的连接带进来，
+    触发 "Future attached to a different loop"。因此每次同步在 asyncio.run 内重建专用引擎。
+    """
     import asyncio
 
     if _sync_state["running"]:
         return
     _sync_state.update(running=True, stage="启动", counts={}, error=None, finished_at=None)
     try:
-        asyncio.run(_run())
+        asyncio.run(_run_isolated())
         _sync_state["stage"] = "完成"
     except Exception as exc:  # noqa: BLE001 —— 同步失败留痕
         logger.exception("ERP inventory sync failed")
@@ -76,7 +80,22 @@ def run_sync() -> None:
         _sync_state["finished_at"] = datetime.now().isoformat(timespec="seconds")
 
 
-async def _run() -> None:
+async def _run_isolated() -> None:
+    """在独立循环内创建专用引擎与会话工厂，跑完后关闭。"""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.config import get_active_database_profile, get_settings
+
+    url = get_active_database_profile(get_settings())["database_url"]
+    engine = create_async_engine(url, pool_pre_ping=False, pool_recycle=1800)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await _run(maker)
+    finally:
+        await engine.dispose()
+
+
+async def _run(session_factory) -> None:
     client = ErpClient()
     site = _site_id()
 

@@ -9,6 +9,7 @@
 全部请求落审计日志（用户/主机/参数/结果行数）。
 """
 
+import json
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
@@ -22,7 +23,9 @@ from app.erp.service import ErpAnalysisService
 from app.erp.token import ErpTokenError, create_read_token, verify_read_token
 from app.adapters.erp import JimuErpAdapter
 from app.core.erp_cache import erp_analysis_cache
+from app.core.database import get_db
 from app.services.narrative import NarrativeService
+from app.services.domain import DatabaseDomainService
 from app.schemas.common import ApiResponse
 
 logger = logging.getLogger(__name__)
@@ -31,6 +34,7 @@ router = APIRouter(prefix="/api/v1/erp", dependencies=[Depends(require_open_rate
 analysis_service = ErpAnalysisService()
 erp_client = ErpClient()
 narrative_service = NarrativeService()
+database_domain_service = DatabaseDomainService()
 
 # token 换取限流（独立于通用限流：更严格）
 token_limiter_window = 60
@@ -239,9 +243,140 @@ async def balance_analysis_narrative(
     text, source = await narrative_service.explain_with_source("平衡利库分析", narrative_input)
     payload = {"text": text, "source": source}
     # 仅缓存大模型成功的结果；模板降级不缓存，下次访问自动重试大模型
-    if source == "llm":
+    if source.startswith("llm"):
         erp_analysis_cache.set(cache_key, payload)
     _audit(request, "balance_analysis.narrative", access, itemnum=itemnum, prnum=prnum, narrative_source=source)
+    return ApiResponse(data=payload)
+
+
+@router.get("/workbench-narrative", response_model=ApiResponse[dict])
+async def workbench_narrative(
+    request: Request,
+    itemnum: str = Query(..., min_length=1, max_length=30),
+    warehouse_id: str | None = Query(default=None, max_length=80),
+    prnum: str | None = Query(default=None, max_length=30),
+    prlinenum: int | None = Query(default=None, ge=1),
+    request_qty: float | None = Query(default=None, ge=0),
+    include_ai: bool = Query(default=True, description="是否等待大模型综合总结；false 只返回确定性面板数据"),
+    access: dict = Depends(require_erp_read),
+    session = Depends(get_db),
+) -> ApiResponse[dict]:
+    """工作台综合 AI 解读：库存原结论 + 五个联动模块的结构化摘要。"""
+    cache_key = "erp:workbench:narrative:v11:{site}:{item}:{wh}:{pr}:{line}:{qty}:ai{ai}".format(
+        site=get_settings().erp_site_id, item=itemnum, wh=warehouse_id or "-",
+        pr=prnum or "-", line=prlinenum or "-", qty=request_qty if request_qty is not None else "-",
+        ai=int(include_ai),
+    )
+    cached = erp_analysis_cache.get(cache_key)
+    if cached is not None:
+        return ApiResponse(data=cached)
+
+    inventory = analysis_service.balance_analysis(
+        itemnum=itemnum, prnum=prnum, prlinenum=prlinenum, request_qty=request_qty,
+    )
+    effective_warehouse = warehouse_id
+    if not effective_warehouse:
+        stock_details = inventory.get("dimensions", {}).get("stock_balance", {}).get("details", [])
+        effective_warehouse = str(stock_details[0].get("LOCATION")) if stock_details else None
+
+    # 其余模块优先读取与工作台一致的本地 ERP 快照；快照未同步时保留空结果，
+    # 不用演示数据替代，库存原始 ERP 结论仍然完整保留。
+    purchase: dict = {}
+    transfers: list[dict] = []
+    forecast: dict = {}
+    prices: dict = {}
+    warnings: list[dict] = []
+    if effective_warehouse:
+        try:
+            purchase = await database_domain_service.purchase_recommendation(session, itemnum, effective_warehouse)
+        except Exception:  # noqa: BLE001 - 综合解读不能阻断原始 ERP 分析
+            purchase = {
+                "warehouse_id": effective_warehouse,
+                "purchase_quantity": inventory.get("conclusion", {}).get("suggested_purchase_qty", 0),
+                "forecast_demand": inventory.get("request_qty", 0),
+                "timing_signal": "暂无",
+                "data_source": "jimu_erp",
+            }
+        try:
+            transfers = await database_domain_service.transfers(session, itemnum)
+        except Exception:  # noqa: BLE001
+            transfers = []
+        try:
+            forecast = await database_domain_service.forecast(session, itemnum, effective_warehouse)
+        except Exception:  # noqa: BLE001
+            forecast = {}
+    try:
+        prices = await database_domain_service.prices(session, itemnum)
+    except Exception:  # noqa: BLE001
+        prices = {}
+    try:
+        warnings = await database_domain_service.warnings(session, itemnum)
+    except Exception:  # noqa: BLE001
+        warnings = []
+
+    price_history = prices.get("history", []) if isinstance(prices, dict) else []
+    narrative_input = {
+        "inventory_balance": {
+            "item": inventory.get("item"),
+            "pr_line": inventory.get("pr_line"),
+            "request_qty": inventory.get("request_qty"),
+            "summary": inventory.get("summary"),
+            "conclusion": inventory.get("conclusion"),
+            "formula_explanation": inventory.get("formula_explanation"),
+        },
+        "purchase_recommendation": {
+            key: purchase.get(key) for key in (
+                "warehouse_id", "purchase_quantity", "forecast_demand", "safety_stock",
+                "available_stock", "in_transit", "reserved_quantity", "available_quantity",
+                "timing_signal", "expected_saving", "data_source",
+            ) if key in purchase
+        },
+        "transfer_recommendations": transfers[:8],
+        "demand_forecast": {
+            "warehouse_id": effective_warehouse,
+            "pattern": forecast.get("pattern", "暂无历史"),
+            "model_name": forecast.get("model_name", "none"),
+            "history_count": len(forecast.get("history", [])),
+            "next_values": [round(float(row.get("value", 0)), 4) for row in forecast.get("forecast", [])[:3]],
+        },
+        "price_timing": {
+            "direction": prices.get("direction", "unknown") if isinstance(prices, dict) else "unknown",
+            "signal": prices.get("signal", "normal") if isinstance(prices, dict) else "normal",
+            "expected_saving": prices.get("expected_saving", 0) if isinstance(prices, dict) else 0,
+            "history_count": len(price_history),
+            "current_price": price_history[-1].get("price") if price_history else None,
+        },
+        "warnings": warnings[:8],
+    }
+    # 大模型可能因输出长度截断；始终追加确定性模块摘要，确保原库存面板和五个联动模块不丢失。
+    deterministic_summary = narrative_service._section_analysis_fallback(narrative_input)["summary"]
+    if include_ai:
+        ai_sections, analysis_source = await narrative_service.analyze_sections(narrative_input)
+        # 某些模型会把完整 JSON 再包成 summary 字符串，统一解包，避免前端展示原始 JSON。
+        summary_value = ai_sections.get("summary", "")
+        if isinstance(summary_value, str) and summary_value.lstrip().startswith("{"):
+            try:
+                embedded = json.loads(summary_value)
+                if isinstance(embedded, dict):
+                    ai_sections = {key: str(embedded.get(key, ai_sections.get(key, ""))) for key in ai_sections}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        # 模型负责业务判断，确定性引擎负责把可执行的平衡利库顺序补全，避免总结缺少动作方案。
+        ai_sections["summary"] = f"{ai_sections.get('summary', '').strip()}\n\n【确定性平衡利库方案】\n{deterministic_summary}"
+        text, source = ai_sections.get("summary", deterministic_summary), analysis_source
+    else:
+        ai_sections, text, source = {}, deterministic_summary, "deterministic"
+    payload = {
+        "text": text,
+        "source": source,
+        "warehouse_id": effective_warehouse,
+        "sections": narrative_input,
+        "ai_sections": ai_sections,
+        "deterministic_summary": deterministic_summary,
+    }
+    if source.startswith("llm") or source == "deterministic":
+        erp_analysis_cache.set(cache_key, payload)
+    _audit(request, "workbench_narrative", access, itemnum=itemnum, warehouse_id=effective_warehouse, prnum=prnum, narrative_source=source)
     return ApiResponse(data=payload)
 
 
@@ -268,44 +403,6 @@ def sync_inventory_status(access: dict = Depends(require_erp_read)) -> ApiRespon
     """ERP→本地库 库存数据同步进度。"""
     from app.erp.sync_inventory import sync_status
     return ApiResponse(data=sync_status())
-async def balance_analysis_narrative(
-    request: Request,
-    itemnum: str = Query(..., min_length=1, max_length=30),
-    prnum: str | None = Query(default=None, max_length=30),
-    prlinenum: int | None = Query(default=None, ge=1),
-    request_qty: float | None = Query(default=None, ge=0),
-    access: dict = Depends(require_erp_read),
-) -> ApiResponse[dict]:
-    """AI 解读（独立端点）：数值全部来自确定性 SQL 与规则，AI 仅生成文字解读（不修改数字），
-    模型不可用时降级为模板。前端并行加载，失败不影响六维度分析展示。"""
-    cache_key = "erp:narrative:{site}:{item}:{pr}:{line}:{qty}".format(
-        site=get_settings().erp_site_id, item=itemnum, pr=prnum or "-",
-        line=prlinenum or "-", qty=request_qty if request_qty is not None else "-",
-    )
-    cached = erp_analysis_cache.get(cache_key)
-    if cached is not None:
-        return ApiResponse(data=cached)
-    result = analysis_service.balance_analysis(
-        itemnum=itemnum,
-        prnum=prnum,
-        prlinenum=prlinenum,
-        request_qty=request_qty,
-    )
-    narrative_input = {
-        "item": result.get("item"),
-        "pr_line": result.get("pr_line"),
-        "request_qty": result.get("request_qty"),
-        "summary": result.get("summary"),
-        "conclusion": result.get("conclusion"),
-        "formula_explanation": result.get("formula_explanation"),
-    }
-    text, source = await narrative_service.explain_with_source("平衡利库分析", narrative_input)
-    payload = {"text": text, "source": source}
-    # 仅缓存大模型成功的结果；模板降级不缓存，下次访问自动重试大模型
-    if source == "llm":
-        erp_analysis_cache.set(cache_key, payload)
-    _audit(request, "balance_analysis.narrative", access, itemnum=itemnum, prnum=prnum, narrative_source=source)
-    return ApiResponse(data=payload)
 
 
 @router.get("/balance-analysis/export")

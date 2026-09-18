@@ -2,6 +2,8 @@ import { Alert, Button, Card, Col, Descriptions, Row, Segmented, Select, Space, 
 import { DownloadOutlined } from "@ant-design/icons";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { BalanceWorkbench } from "../components/BalanceWorkbench";
+import { NarrativePanels } from "../components/NarrativePanels";
 
 /** 积木嵌入专用落地页：/erp/analysis?prnum=&linenum=&itemnum=
  *  入口为积木立项申请页的「AI平衡利库分析」按钮，携带申请行参数直达。
@@ -233,7 +235,7 @@ export function ErpAnalysisPage() {
   const [linenum, setLinenum] = useState<string | null>(params.get("linenum"));
   const [suggestField, setSuggestField] = useState("itemnum");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
-  const [narrative, setNarrative] = useState<{ text: string; source: string } | null>(null);
+  const [narrative, setNarrative] = useState<{ text: string; source: string; sections?: Record<string, unknown>; ai_sections?: Record<string, string> } | null>(null);
   const [narrativeLoading, setNarrativeLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -259,15 +261,21 @@ export function ErpAnalysisPage() {
     if (effectiveLn) query.set("prlinenum", effectiveLn);
     const bind = { prnum: effectivePr, itemnum: code, prlinenum: effectiveLn };
     const narrativeQuery = query.toString();
+    const panelQuery = new URLSearchParams(query);
+    panelQuery.set("include_ai", "false");
     // 分析与 AI 解读完全解耦：分析先渲染，解读卡片独立异步加载，互不阻塞
     setNarrativeLoading(true);
     erpGet<Analysis>(`/erp/balance-analysis?${query.toString()}`, bind)
       .then((analysisResult) => setAnalysis(analysisResult))
       .catch((reason) => { setError(reason instanceof Error ? reason.message : "分析失败"); setAnalysis(null); })
       .finally(() => setLoading(false));
-    erpGet<{ text: string; source: string }>(`/erp/balance-analysis/narrative?${narrativeQuery}`, bind)
-      .then((payload) => setNarrative(payload))
-      .catch(() => setNarrative(null))
+    // 先取确定性面板数据，让分页结论立即可见；综合 AI 总结在后台完成并放在最后一页。
+    erpGet<{ text: string; source: string; sections?: Record<string, unknown>; ai_sections?: Record<string, string> }>(`/erp/workbench-narrative?${panelQuery.toString()}`, bind)
+      .then((payload) => setNarrative((current) => current?.source?.startsWith("llm") ? { ...current, sections: payload.sections ?? current.sections, ai_sections: payload.ai_sections ?? current.ai_sections } : payload))
+      .catch(() => {})
+    erpGet<{ text: string; source: string; sections?: Record<string, unknown>; ai_sections?: Record<string, string> }>(`/erp/workbench-narrative?${narrativeQuery}`, bind)
+      .then((payload) => setNarrative((current) => ({ ...payload, sections: payload.sections ?? current?.sections, ai_sections: payload.ai_sections ?? current?.ai_sections })))
+      .catch(() => {})
       .finally(() => setNarrativeLoading(false));
   }, [prnum, linenum]);
 
@@ -382,19 +390,7 @@ export function ErpAnalysisPage() {
               description={`建议采购量 ${analysis.conclusion.suggested_purchase_qty}${unit}（叠加安全库存参考 ${analysis.conclusion.suggested_purchase_with_safety}${unit}）`}
             />
 
-            {(narrativeLoading || narrative?.text) && (
-              <Card size="small" title={<Space>AI 解读{narrativeLoading
-                ? <Spin size="small" />
-                : <Tag color={narrative?.source === "llm" ? "purple" : "default"}>{narrative?.source === "llm" ? "大模型生成" : "模板解读"}</Tag>}
-              </Space>}>
-                {narrativeLoading
-                  ? <Typography.Text type="secondary">AI 正在生成解读…（不影响下方分析结果）</Typography.Text>
-                  : <>
-                      <Typography.Paragraph style={{ marginBottom: 4, whiteSpace: "pre-wrap" }}>{narrative?.text}</Typography.Paragraph>
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>数值均来自 ERP 确定性查询，AI 仅作文字解读，不参与计算。</Typography.Text>
-                    </>}
-              </Card>
-            )}
+            <NarrativePanels analysis={analysis} narrative={narrative} loading={narrativeLoading} />
 
             <Row gutter={12}>
               <Col span={4}><Card size="small"><Statistic title="历史采购量" value={analysis.summary.history_purchase_qty} suffix={unit} /></Card></Col>
@@ -412,6 +408,8 @@ export function ErpAnalysisPage() {
             <Card size="small" title={`可用量 = 库存量 ${analysis.summary.stock_qty} + 在途量 ${analysis.summary.in_transit_qty} − 预留量 ${analysis.summary.reserved_qty} = ${analysis.summary.available_qty}${unit}`}>
               <Typography.Text type="secondary">{analysis.formula_explanation.in_transit}；{analysis.formula_explanation.safety}</Typography.Text>
             </Card>
+
+            <BalanceWorkbench sku={analysis.item.ITEMNUM} unit={unit} />
 
             <Card size="small" title={`历史采购（合同条目 ${analysis.dimensions.history_purchase.contract_lines} 条，合计 ${analysis.dimensions.history_purchase.total_qty}${unit}）`}>
               <Table size="small" rowKey={(r) => `${r.PONUM}-${r.POLINENUM}`} columns={contractColumns} dataSource={analysis.dimensions.history_purchase.details} pagination={{ pageSize: 5 }} scroll={{ x: 800 }} />

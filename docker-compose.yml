@@ -34,11 +34,16 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql+aiomysql://liku:liku@mysql:3306/liku}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
       STORAGE_PATH: /app/storage
       PYTHONPATH: /app/backend
+      # 容器内访问 ERP：Docker Desktop NAT 失效后改走宿主机转发（scripts/erp_port_forward.py）
+      ERP_DB_HOST: host.docker.internal
+      ERP_DB_PORT: "13306"
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend:/app/backend
       - ./storage:/app/storage
@@ -63,9 +68,13 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql+aiomysql://liku:liku@mysql:3306/liku}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
       STORAGE_PATH: /app/storage
       PYTHONPATH: /app/backend
+      ERP_DB_HOST: host.docker.internal
+      ERP_DB_PORT: "13306"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend:/app/backend
       - ./storage:/app/storage
@@ -87,9 +96,13 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql+aiomysql://liku:liku@mysql:3306/liku}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_URL: redis://redis:6379/0
       STORAGE_PATH: /app/storage
       PYTHONPATH: /app/backend
+      ERP_DB_HOST: host.docker.internal
+      ERP_DB_PORT: "13306"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend:/app/backend
       - ./storage:/app/storage

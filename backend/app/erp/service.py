@@ -13,6 +13,7 @@ matusetrans 领用 ISSUE 为负、退料 RETURN 为正。
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from app.core.config import get_settings
@@ -21,6 +22,15 @@ from app.erp.client import ErpClient, ErpQueryError
 # 视为有效合同的 po.STATUS（排除未批准与已取消）
 _VALID_PO_EXCLUDE = ("'WAPPR'", "'CAN'")
 _OPEN_PO_EXCLUDE = ("'CLOSE'", "'CAN'", "'CLOSED'", "'WAPPR'")
+
+# 到货/入库核销子查询：matrectrans RECEIPT/RETURN 按 合同行 聚合（RETURN 为负自动冲减）
+_RECEIVED_NOTE = "receipt join uses PONUM+POLINENUM only"
+_RECEIVED_AGG = (
+    "LEFT JOIN (SELECT PONUM, POLINENUM, SUM(QUANTITY) AS received_qty "
+    "FROM matrectrans WHERE ISSUETYPE IN ('RECEIPT', 'RETURN') "
+    "GROUP BY PONUM, POLINENUM) r "
+    "ON r.PONUM = p.PONUM AND r.POLINENUM = p.POLINENUM"
+)
 
 
 class ErpAnalysisService:
@@ -161,6 +171,213 @@ class ErpAnalysisService:
             "received_qty": float(summary["received_qty"] or 0),
             "returned_qty": float(summary["returned_qty"] or 0),
             "net_received_qty": float(summary["net_received_qty"] or 0),
+        }
+
+    def price_history(self, itemnum: str, site_id: str) -> list[dict[str, Any]]:
+        """采购入库实际单价历史，作为本地价格快照缺失时的只读回退。"""
+        return self.client.fetch_all(
+            "SELECT ITEMNUM, COALESCE(NULLIF(PONUM, ''), 'ERP') AS SUPPLIER, "
+            "UNITCOST AS PRICE, ACTUALDATE AS RECORDED_AT "
+            "FROM matrectrans WHERE ITEMNUM = %s AND SITEID = %s "
+            "AND ISSUETYPE = 'RECEIPT' AND UNITCOST > 0 AND ACTUALDATE IS NOT NULL "
+            "ORDER BY ACTUALDATE",
+            [itemnum, site_id], limit=200,
+        )
+
+    # ---------- 到货率与供应交期（库存智能问答 / 安全库存优化用） ----------
+
+    @staticmethod
+    def _arrival_where(itemnum: str | None, supplier: str | None, start: date | None, end: date | None) -> tuple[str, list[Any]]:
+        """到货率共用的 WHERE 与参数（供应商为模糊匹配，LIKE 已转义）。"""
+        where = f"po.SITEID = %s AND po.STATUS NOT IN ({','.join(_VALID_PO_EXCLUDE)}) AND p.ITEMNUM IS NOT NULL"
+        params: list[Any] = [get_settings().erp_site_id]
+        if itemnum:
+            where += " AND p.ITEMNUM = %s"
+            params.append(itemnum)
+        if supplier:
+            where += " AND po.VENDOR LIKE %s"
+            params.append(f"%{ErpAnalysisService._escape_like(supplier)}%")
+        if start:
+            where += " AND COALESCE(po.ORDERDATE, po.STARTDATE) >= %s"
+            params.append(start)
+        if end:
+            where += " AND COALESCE(po.ORDERDATE, po.STARTDATE) <= %s"
+            params.append(end)
+        return where, params
+
+    def arrival_rate(self, itemnum: str | None = None, supplier: str | None = None,
+                     start: date | None = None, end: date | None = None) -> dict[str, Any]:
+        """到货率 = Σ已入库 / Σ合同数量（数量口径，仅有效合同；入库按 matrectrans 流水核销）。
+
+        支持物资/供应商（模糊）/时间段三个维度；未指定时间段时默认统计近 12 个月
+        （ERP 入库流水仅覆盖近年，全历史口径会因合同多、流水少而严重失真）；
+        分母为 0 时 overall_rate 返回 None（不除零）。
+        """
+        window_applied = start is None and end is None
+        if window_applied:
+            from datetime import timedelta
+            start = date.today() - timedelta(days=365)
+        where, params = self._arrival_where(itemnum, supplier, start, end)
+        totals = self.client.fetch_all(
+            "SELECT COALESCE(SUM(p.ORDERQTY), 0) AS total_ordered, "
+            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS total_received, "
+            "COUNT(*) AS contract_lines "
+            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
+            f"WHERE {where} LIMIT 1",
+            params, limit=1,
+        )[0]
+        ordered = float(totals.get("total_ordered") or 0)
+        received = float(totals.get("total_received") or 0)
+
+        def _rate(numerator: float, denominator: float) -> float | None:
+            return round(numerator / denominator, 4) if denominator > 0 else None
+
+        by_month = self.client.fetch_all(
+            "SELECT DATE_FORMAT(COALESCE(po.ORDERDATE, po.STARTDATE), '%%Y-%%m') AS MONTH, "
+            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
+            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS received_qty "
+            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
+            f"WHERE {where} GROUP BY MONTH ORDER BY MONTH DESC",
+            params, limit=24,
+        )
+        by_supplier = self.client.fetch_all(
+            "SELECT COALESCE(NULLIF(po.VENDOR, ''), '未填供应商') AS VENDOR, "
+            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
+            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS received_qty "
+            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
+            f"WHERE {where} GROUP BY VENDOR ORDER BY ordered_qty DESC",
+            params, limit=20,
+        )
+        by_item = self.client.fetch_all(
+            "SELECT p.ITEMNUM, "
+            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
+            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS received_qty "
+            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
+            f"WHERE {where} GROUP BY p.ITEMNUM ORDER BY ordered_qty DESC",
+            params, limit=20,
+        )
+
+        def _with_rate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            out = []
+            for row in rows:
+                row_ordered = float(row.get("ordered_qty") or 0)
+                row_received = float(row.get("received_qty") or 0)
+                out.append({**row, "rate": _rate(row_received, row_ordered)})
+            return out
+
+        return {
+            "itemnum": itemnum,
+            "supplier": supplier,
+            "start": str(start) if start else None,
+            "end": str(end) if end else None,
+            "window_applied": window_applied,
+            "contract_lines": int(totals.get("contract_lines") or 0),
+            "total_ordered": round(ordered, 2),
+            "total_received": round(received, 2),
+            "overall_rate": _rate(received, ordered),
+            "by_month": _with_rate(by_month),
+            "by_supplier": _with_rate(by_supplier),
+            "by_item": _with_rate(by_item),
+            "formula_explanation": "到货率 = 已入库数量 / 合同数量（数量口径，仅统计有效合同；入库按 matrectrans 接收流水核销，退库负数冲减）",
+        }
+
+    def lead_time(self, itemnum: str | None = None, supplier: str | None = None) -> dict[str, Any] | None:
+        """实测供应交期（月）= 首次入库日期 − 合同下单日期，按维度聚合。
+
+        口径说明（实测）：
+        - 入库流水（matrectrans）与 poline 的行级匹配率为 0，与 po 的 PONUM 匹配率 99.8%，
+          且入库多记在 PDSITE、合同在 PHP，因此只按 PONUM 关联 po，不带 SITEID；
+        - 仅统计首次入库不早于下单日期的样本（99.99% 样本满足）。
+        回退顺序：物资 → 供应商 → 全厂实测均值 → None（调用方用配置默认值）。
+        """
+        receipt_filters = ["ISSUETYPE = 'RECEIPT'", "ACTUALDATE IS NOT NULL", "PONUM IS NOT NULL", "PONUM <> ''"]
+        receipt_params: list[Any] = []
+        if itemnum:
+            receipt_filters.append("ITEMNUM = %s")
+            receipt_params.append(itemnum)
+        first_receipt = (
+            "JOIN (SELECT PONUM, MIN(ACTUALDATE) AS first_receipt FROM matrectrans "
+            f"WHERE {' AND '.join(receipt_filters)} GROUP BY PONUM) r ON r.PONUM = m.PONUM"
+        )
+        valid_po = (
+            f"po.ORDERDATE IS NOT NULL AND po.STATUS NOT IN ({','.join(_VALID_PO_EXCLUDE)}) "
+        )
+
+        def _query(group_expr: str, extra_where: str, params: list[Any]) -> dict[str, Any] | None:
+            rows = self.client.fetch_all(
+                "SELECT " + group_expr + " AS GROUP_KEY, "
+                "AVG(DATEDIFF(r.first_receipt, po.ORDERDATE)) / 30.4 AS lead_months, "
+                "MIN(DATEDIFF(r.first_receipt, po.ORDERDATE)) AS min_days, "
+                "MAX(DATEDIFF(r.first_receipt, po.ORDERDATE)) AS max_days, "
+                "COUNT(*) AS samples "
+                "FROM matrectrans m "
+                f"JOIN po ON po.PONUM = m.PONUM {first_receipt} "
+                "WHERE m.ISSUETYPE = 'RECEIPT' AND " + valid_po +
+                " AND r.first_receipt >= po.ORDERDATE" + extra_where +
+                " GROUP BY GROUP_KEY ORDER BY samples DESC LIMIT 1",
+                params, limit=1,
+            )
+            if not rows:
+                return None
+            row = rows[0]
+            return {
+                "group_key": str(row.get("GROUP_KEY")),
+                "lead_months": round(float(row.get("lead_months") or 0), 2),
+                "min_days": int(row.get("min_days") or 0),
+                "max_days": int(row.get("max_days") or 0),
+                "samples": int(row.get("samples") or 0),
+            }
+
+        if itemnum:
+            hit = _query("m.ITEMNUM", " AND m.ITEMNUM = %s", [*receipt_params, itemnum])
+            if hit:
+                return {**hit, "dimension": "item"}
+            vendor_rows = self.client.fetch_all(
+                "SELECT po.VENDOR FROM matrectrans m JOIN po ON po.PONUM = m.PONUM "
+                "WHERE m.ISSUETYPE = 'RECEIPT' AND m.ITEMNUM = %s AND " + valid_po +
+                " AND COALESCE(NULLIF(po.VENDOR, ''), '') <> '' ORDER BY m.ACTUALDATE DESC",
+                [itemnum], limit=1,
+            )
+            if vendor_rows and vendor_rows[0].get("VENDOR"):
+                vendor = vendor_rows[0]["VENDOR"]
+                hit = _query("po.VENDOR", " AND po.VENDOR = %s", [*receipt_params, vendor])
+                if hit:
+                    return {**hit, "dimension": "supplier", "via_item": itemnum}
+        if supplier:
+            hit = _query("po.VENDOR", " AND po.VENDOR LIKE %s",
+                         [*receipt_params, f"%{self._escape_like(supplier)}%"])
+            if hit:
+                return {**hit, "dimension": "supplier"}
+        # 兜底：全厂实测均值（仍为实测值，优于配置默认）
+        site_hit = self._site_lead_time()
+        if site_hit:
+            return {**site_hit, "dimension": "site"}
+        return None
+
+    def _site_lead_time(self) -> dict[str, Any] | None:
+        """全厂实测交期均值（复用主流程的关联口径，无额外过滤）。"""
+        rows = self.client.fetch_all(
+            "SELECT AVG(DATEDIFF(r.first_receipt, po.ORDERDATE)) / 30.4 AS lead_months, "
+            "MIN(DATEDIFF(r.first_receipt, po.ORDERDATE)) AS min_days, "
+            "MAX(DATEDIFF(r.first_receipt, po.ORDERDATE)) AS max_days, COUNT(*) AS samples "
+            "FROM matrectrans m "
+            "JOIN po ON po.PONUM = m.PONUM "
+            "JOIN (SELECT PONUM, MIN(ACTUALDATE) AS first_receipt FROM matrectrans "
+            "WHERE ISSUETYPE = 'RECEIPT' AND ACTUALDATE IS NOT NULL AND PONUM IS NOT NULL AND PONUM <> '' "
+            "GROUP BY PONUM) r ON r.PONUM = m.PONUM "
+            "WHERE m.ISSUETYPE = 'RECEIPT' AND " + f"po.ORDERDATE IS NOT NULL AND po.STATUS NOT IN ({','.join(_VALID_PO_EXCLUDE)}) " +
+            "AND r.first_receipt >= po.ORDERDATE LIMIT 1",
+            [], limit=1,
+        )
+        if not rows or not rows[0].get("samples"):
+            return None
+        row = rows[0]
+        return {
+            "group_key": get_settings().erp_site_id,
+            "lead_months": round(float(row.get("lead_months") or 0), 2),
+            "min_days": int(row.get("min_days") or 0),
+            "max_days": int(row.get("max_days") or 0),
+            "samples": int(row.get("samples") or 0),
         }
 
     # ---------- 搜索联想 ----------

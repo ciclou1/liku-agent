@@ -5,12 +5,20 @@ import { api } from "../api/client";
 
 interface Message { role: "user" | "assistant"; content: string; sources?: string[]; }
 
+const QUICK_QUESTIONS = [
+  "帮我生成一份库存统计报表",
+  "20002183 的到货率如何？",
+  "最近消耗情况怎么样？",
+  "M12螺栓哪个仓库有现货？",
+  "哪些物资呆滞超过一年了？",
+];
+
 export function ChatPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [value, setValue] = useState("");
   const [sessionId, setSessionId] = useState<string>();
-  const send = async () => {
-    const message = value.trim();
+  const send = async (text?: string) => {
+    const message = (text ?? value).trim();
     if (!message) return;
     setValue("");
     setMessages((items) => [...items, { role: "user", content: message }]);
@@ -23,7 +31,10 @@ export function ChatPanel() {
     }
   };
   return <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-    <List size="small" dataSource={messages} locale={{ emptyText: "可以问：M12螺栓哪个仓库有现货？" }} renderItem={(item) => <List.Item><Space direction="vertical" size={4}><Typography.Text strong>{item.role === "user" ? "我" : "智能助手"}</Typography.Text><Typography.Text>{item.content}</Typography.Text>{item.sources?.length ? <Space size={4} wrap>{item.sources.map((source) => <Tag key={source}>{source}</Tag>)}</Space> : null}</Space></List.Item>} />
-    <Input.Search value={value} onChange={(event) => setValue(event.target.value)} onSearch={send} enterButton={<Button icon={<SendOutlined />}>发送</Button>} placeholder="例如：M12螺栓哪个仓库有现货？" />
+    <Space size={8} wrap>
+      {QUICK_QUESTIONS.map((question) => <Button key={question} size="small" onClick={() => void send(question)}>{question}</Button>)}
+    </Space>
+    <List size="small" dataSource={messages} locale={{ emptyText: "可以问：到货率、库存统计报表、消耗情况、现货位置、呆滞预警……" }} renderItem={(item) => <List.Item><Space direction="vertical" size={4}><Typography.Text strong>{item.role === "user" ? "我" : "智能助手"}</Typography.Text><Typography.Text>{item.content}</Typography.Text>{item.sources?.length ? <Space size={4} wrap>{item.sources.map((source) => <Tag key={source}>{source}</Tag>)}</Space> : null}</Space></List.Item>} />
+    <Input.Search value={value} onChange={(event) => setValue(event.target.value)} onSearch={() => void send()} enterButton={<Button icon={<SendOutlined />}>发送</Button>} placeholder="例如：20002183 的到货率如何？" />
   </Space>;
 }

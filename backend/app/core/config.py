@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     erp_connect_timeout_seconds: int = 5
     erp_query_timeout_seconds: int = 30
     erp_analysis_cache_ttl_seconds: int = 300
+    # 安全库存优化：ERP 实测交期缺失时的默认交期（月）
+    replenishment_default_lead_months: float = 1.0
     # 允许 iframe 嵌入的来源（积木 ERP 页面嵌入时填其 origin，如 http://172.20.0.125:8080；空 = 禁止嵌入）
     frame_ancestors: str = "http://172.20.0.125:8080"
     # 允许跨域访问 API 的额外来源（嵌入页前端直连后端时需要）
