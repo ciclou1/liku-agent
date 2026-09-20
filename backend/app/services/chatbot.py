@@ -98,13 +98,15 @@ def format_tool_facts(tool_name: str, result: Any) -> str:
         if rate is None:
             return "查询范围内没有符合条件的采购合同数据，无法计算到货率。"
         scope = result.get("itemnum") or result.get("supplier")
-        window = f"{result.get('start')} ~ {result.get('end')}" if result.get("start") else "全部时间"
-        text = f"{scope + ' ' if scope else ''}在 {window} 的到货率 {rate * 100:.1f}%（有效合同 {result.get('contract_lines', 0)} 行，合同量 {result.get('total_ordered', 0)}，已入库 {result.get('total_received', 0)}）。"
         if result.get("window_applied"):
-            text += "（未指定时间段时默认统计近 12 个月；可通过日期参数查询其他区间）"
-        months = [f"{row['MONTH']} {(row.get('rate') or 0) * 100:.1f}%" for row in (result.get("by_month") or [])[:6] if row.get("MONTH")]
-        if months:
-            text += " 近几月：" + "、".join(months) + "。"
+            window = f"{result.get('start')} ~ {result.get('end')}"
+        else:
+            window = "全部历史"
+        text = (f"{scope + ' ' if scope else ''}在 {window} 的到货率 {rate * 100:.1f}%"
+                f"（涉及 {result.get('contracts', 0)} 份合同，合同量 {result.get('total_ordered', 0)}，"
+                f"已入库 {result.get('total_received', 0)}）。")
+        # 不展示月度拆分：实测 ERP 的 po.ORDERDATE 大量是「某年 1 月 1 日」占位值，
+        # 按月聚合会把全年合同堆到 1 月，给出误导性趋势。原始数据仍在接口 payload 里。
         suppliers = [f"{row['VENDOR']} {(row.get('rate') or 0) * 100:.1f}%" for row in (result.get("by_supplier") or [])[:3]]
         if suppliers:
             text += " 主要供应商到货率：" + "、".join(suppliers) + "。"

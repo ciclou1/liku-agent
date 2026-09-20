@@ -42,6 +42,10 @@ class DormantService:
             .offset((max(1, page) - 1) * size).limit(size))).all()
 
         page_skus = {row[0].sku for row in rows}
+        # 库房字典：优先取，既用于展示，也用于过滤脏库房值
+        # （ERP 的 matusetrans.STORELOC 实测存在 '{}' 等非库房值，不能当作调剂目标）
+        warehouse_names = {row.warehouse_id: row.name for row in
+                           (await session.execute(select(Warehouse))).scalars().all()}
         # 调剂信号：其他仓库近 12 个月有领用，且现存量低于需求
         # （安全库存；ERP 未设 MINLEVEL 时用该仓年领用量，避免 safety=0 永远无缺口）
         transfer_demand: dict[str, list[str]] = {}
@@ -60,6 +64,8 @@ class DormantService:
                 stock_by_key = {(r.sku, r.warehouse_id): (float(r.available_quantity or 0), float(r.safety_stock or 0))
                                 for r in stock_rows.all()}
                 for (sku, wh), year_usage in usage_by_key.items():
+                    if wh not in warehouse_names:
+                        continue  # 库房字典外的脏值（如 '{}'）不构成调剂目标
                     available, safety = stock_by_key.get((sku, wh), (0.0, 0.0))
                     needed = safety if safety > 0 else year_usage
                     if year_usage > 0 and available < needed:
@@ -99,8 +105,6 @@ class DormantService:
                 for sku, last_date, supplier in price_rows.all():
                     if sku not in last_purchases and last_date:
                         last_purchases[sku] = {"date": str(last_date), "supplier": supplier or "供应商"}
-        warehouse_names = {row.warehouse_id: row.name for row in
-                           (await session.execute(select(Warehouse))).scalars().all()}
 
         items = []
         for snapshot, name, unit in rows:
@@ -113,7 +117,7 @@ class DormantService:
                 "unit_cost": float(snapshot.unit_cost or 0),
                 "last_used_at": snapshot.last_used_at,
                 "has_transfer_demand": bool(demand_whs),
-                "demand_warehouse": "、".join(warehouse_names.get(wh, wh) for wh in demand_whs[:3]) if demand_whs else None,
+                "demand_warehouse": "、".join(warehouse_names[wh] for wh in demand_whs[:3] if wh in warehouse_names) or None,
                 "last_purchase": last_purchases.get(snapshot.sku),
             }, today)
             items.append({

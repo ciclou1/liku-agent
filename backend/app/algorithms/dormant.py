@@ -54,7 +54,9 @@ def classify_disposal(row: dict, today: date) -> DisposalResult:
     idle = _days_idle(row.get("last_used_at"), today)
 
     if row.get("has_transfer_demand"):
-        demand_warehouse = str(row.get("demand_warehouse") or "其他仓库")
+        # 调用方只传库房字典里的名称；仍做一次兜底，避免脏编码（如 ERP 的 '{}'）落到文案里
+        raw = str(row.get("demand_warehouse") or "").strip()
+        demand_warehouse = raw if raw and raw not in ("{}", "None") else "其他仓库"
         basis = f"{demand_warehouse} 近 12 个月有领用且现存量低于需求，建议优先内部调剂"
         return DisposalResult(row["sku"], row["warehouse_id"], TRANSFER, basis, amount, idle)
 

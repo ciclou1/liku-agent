@@ -23,15 +23,6 @@ from app.erp.client import ErpClient, ErpQueryError
 _VALID_PO_EXCLUDE = ("'WAPPR'", "'CAN'")
 _OPEN_PO_EXCLUDE = ("'CLOSE'", "'CAN'", "'CLOSED'", "'WAPPR'")
 
-# 到货/入库核销子查询：matrectrans RECEIPT/RETURN 按 合同行 聚合（RETURN 为负自动冲减）
-_RECEIVED_NOTE = "receipt join uses PONUM+POLINENUM only"
-_RECEIVED_AGG = (
-    "LEFT JOIN (SELECT PONUM, POLINENUM, SUM(QUANTITY) AS received_qty "
-    "FROM matrectrans WHERE ISSUETYPE IN ('RECEIPT', 'RETURN') "
-    "GROUP BY PONUM, POLINENUM) r "
-    "ON r.PONUM = p.PONUM AND r.POLINENUM = p.POLINENUM"
-)
-
 
 class ErpAnalysisService:
     def __init__(self, client: ErpClient | None = None) -> None:
@@ -187,98 +178,148 @@ class ErpAnalysisService:
     # ---------- 到货率与供应交期（库存智能问答 / 安全库存优化用） ----------
 
     @staticmethod
-    def _arrival_where(itemnum: str | None, supplier: str | None, start: date | None, end: date | None) -> tuple[str, list[Any]]:
-        """到货率共用的 WHERE 与参数（供应商为模糊匹配，LIKE 已转义）。"""
-        where = f"po.SITEID = %s AND po.STATUS NOT IN ({','.join(_VALID_PO_EXCLUDE)}) AND p.ITEMNUM IS NOT NULL"
+    def _ordered_where(itemnum: str | None, supplier: str | None, start: date | None, end: date | None) -> tuple[str, list[Any]]:
+        """合同侧（订购量）过滤条件与参数（供应商模糊匹配，LIKE 已转义）。"""
+        clauses = [f"po.SITEID = %s", f"po.STATUS NOT IN ({','.join(_VALID_PO_EXCLUDE)})", "p.ITEMNUM IS NOT NULL"]
         params: list[Any] = [get_settings().erp_site_id]
         if itemnum:
-            where += " AND p.ITEMNUM = %s"
+            clauses.append("p.ITEMNUM = %s")
             params.append(itemnum)
         if supplier:
-            where += " AND po.VENDOR LIKE %s"
+            clauses.append("po.VENDOR LIKE %s")
             params.append(f"%{ErpAnalysisService._escape_like(supplier)}%")
         if start:
-            where += " AND COALESCE(po.ORDERDATE, po.STARTDATE) >= %s"
+            clauses.append("COALESCE(po.ORDERDATE, po.STARTDATE) >= %s")
             params.append(start)
         if end:
-            where += " AND COALESCE(po.ORDERDATE, po.STARTDATE) <= %s"
+            clauses.append("COALESCE(po.ORDERDATE, po.STARTDATE) <= %s")
             params.append(end)
-        return where, params
+        return " AND ".join(clauses), params
+
+    @staticmethod
+    def _received_where(itemnum: str | None, start: date | None, end: date | None) -> tuple[str, list[Any]]:
+        """入库侧（到货量）过滤条件与参数。
+
+        实测口径：入库流水的 PONUM 与 poline 的合同行关联命中率仅 0.86%，
+        因此入库量按流水自带的 ITEMNUM 汇总，不做行级核销；
+        入库多记在 PDSITE、合同在 PHP，故不在入库侧做站点过滤。
+        RETURN 流水 quantity 为负，自动冲减。
+        """
+        clauses = ["m.ISSUETYPE IN ('RECEIPT','RETURN')", "m.ITEMNUM IS NOT NULL", "m.ITEMNUM <> ''"]
+        params: list[Any] = []
+        if itemnum:
+            clauses.append("m.ITEMNUM = %s")
+            params.append(itemnum)
+        if start:
+            clauses.append("m.ACTUALDATE >= %s")
+            params.append(start)
+        if end:
+            clauses.append("m.ACTUALDATE <= %s")
+            params.append(end)
+        return " AND ".join(clauses), params
 
     def arrival_rate(self, itemnum: str | None = None, supplier: str | None = None,
                      start: date | None = None, end: date | None = None) -> dict[str, Any]:
-        """到货率 = Σ已入库 / Σ合同数量（数量口径，仅有效合同；入库按 matrectrans 流水核销）。
+        """到货率 = 已入库数量 / 合同数量（数量口径，仅有效合同）。
 
-        支持物资/供应商（模糊）/时间段三个维度；未指定时间段时默认统计近 12 个月
-        （ERP 入库流水仅覆盖近年，全历史口径会因合同多、流水少而严重失真）；
-        分母为 0 时 overall_rate 返回 None（不除零）。
+        口径说明（由实测数据决定）：
+        - 入库流水与 poline 的合同行关联命中率仅 0.86%，故不做行级核销：
+          物资维度分别按两边各自的 ITEMNUM 汇总比较；
+        - 供应商/月份维度经 PONUM 关联 po 取 VENDOR 与下单月份（该关联匹配率 99.8%）；
+        - 时间段分别作用于合同下单日期与入库日期；
+        - 未指定时间段时统计全部历史 —— ERP 合同数据止于 2025 年初，近 12 个月
+          仅 2 行有效合同，按近一年过滤会让结果恒为“无法计算”；
+        - 不提供月度拆分：实测 po.ORDERDATE 大量是“某年 1 月 1 日”占位值，
+          按月聚合会把全年合同堆进 1 月，输出误导性趋势；
+        - 分母为 0 时 rate 返回 None（不除零）。
         """
-        window_applied = start is None and end is None
-        if window_applied:
-            from datetime import timedelta
-            start = date.today() - timedelta(days=365)
-        where, params = self._arrival_where(itemnum, supplier, start, end)
-        totals = self.client.fetch_all(
-            "SELECT COALESCE(SUM(p.ORDERQTY), 0) AS total_ordered, "
-            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS total_received, "
-            "COUNT(*) AS contract_lines "
-            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
-            f"WHERE {where} LIMIT 1",
-            params, limit=1,
-        )[0]
-        ordered = float(totals.get("total_ordered") or 0)
-        received = float(totals.get("total_received") or 0)
+        ordered_where, ordered_params = self._ordered_where(itemnum, supplier, start, end)
+        received_where, received_params = self._received_where(itemnum, start, end)
 
         def _rate(numerator: float, denominator: float) -> float | None:
             return round(numerator / denominator, 4) if denominator > 0 else None
 
-        by_month = self.client.fetch_all(
-            "SELECT DATE_FORMAT(COALESCE(po.ORDERDATE, po.STARTDATE), '%%Y-%%m') AS MONTH, "
-            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
-            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS received_qty "
-            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
-            f"WHERE {where} GROUP BY MONTH ORDER BY MONTH DESC",
-            params, limit=24,
+        ordered_rows = self.client.fetch_all(
+            "SELECT COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
+            "COUNT(DISTINCT po.PONUM) AS contracts "
+            "FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID "
+            f"WHERE {ordered_where}",
+            ordered_params, limit=1,
         )
-        by_supplier = self.client.fetch_all(
-            "SELECT COALESCE(NULLIF(po.VENDOR, ''), '未填供应商') AS VENDOR, "
-            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
-            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS received_qty "
-            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
-            f"WHERE {where} GROUP BY VENDOR ORDER BY ordered_qty DESC",
-            params, limit=20,
+        received_rows = self.client.fetch_all(
+            "SELECT COALESCE(SUM(m.QUANTITY), 0) AS received_qty FROM matrectrans m "
+            f"WHERE {received_where}",
+            received_params, limit=1,
         )
-        by_item = self.client.fetch_all(
-            "SELECT p.ITEMNUM, "
-            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty, "
-            "COALESCE(SUM(CASE WHEN COALESCE(r.received_qty, 0) < 0 THEN 0 ELSE COALESCE(r.received_qty, 0) END), 0) AS received_qty "
-            f"FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID {_RECEIVED_AGG} "
-            f"WHERE {where} GROUP BY p.ITEMNUM ORDER BY ordered_qty DESC",
-            params, limit=20,
-        )
+        ordered_total = float(ordered_rows[0].get("ordered_qty") or 0) if ordered_rows else 0.0
+        received_total = float(received_rows[0].get("received_qty") or 0) if received_rows else 0.0
+        contracts = int(ordered_rows[0].get("contracts") or 0) if ordered_rows else 0
 
-        def _with_rate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            out = []
-            for row in rows:
-                row_ordered = float(row.get("ordered_qty") or 0)
-                row_received = float(row.get("received_qty") or 0)
-                out.append({**row, "rate": _rate(row_received, row_ordered)})
-            return out
+        # ── 物资维度：两边各自的 ITEMNUM 对不上就用 0（该物资无入库）──
+        ordered_items = self.client.fetch_all(
+            "SELECT p.ITEMNUM, COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty "
+            "FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID "
+            f"WHERE {ordered_where} GROUP BY p.ITEMNUM ORDER BY ordered_qty DESC",
+            ordered_params, limit=20,
+        )
+        received_by_item: dict[str, float] = {}
+        if ordered_items:
+            item_nums = [str(row["ITEMNUM"]) for row in ordered_items]
+            placeholders = ",".join(["%s"] * len(item_nums))
+            for row in self.client.fetch_all(
+                    "SELECT m.ITEMNUM, COALESCE(SUM(m.QUANTITY), 0) AS received_qty "
+                    f"FROM matrectrans m WHERE {received_where} AND m.ITEMNUM IN ({placeholders}) "
+                    "GROUP BY m.ITEMNUM",
+                    [*received_params, *item_nums], limit=len(item_nums) or 1):
+                received_by_item[str(row["ITEMNUM"])] = float(row.get("received_qty") or 0)
+        by_item = [{
+            "ITEMNUM": str(row["ITEMNUM"]),
+            "ordered_qty": round(float(row["ordered_qty"] or 0), 2),
+            "received_qty": round(received_by_item.get(str(row["ITEMNUM"]), 0.0), 2),
+            "rate": _rate(received_by_item.get(str(row["ITEMNUM"]), 0.0), float(row["ordered_qty"] or 0)),
+        } for row in ordered_items]
+
+        # ── 供应商维度：入库无供应商字段，经 PONUM 关联 po ──
+        ordered_suppliers = self.client.fetch_all(
+            "SELECT COALESCE(NULLIF(po.VENDOR, ''), '未填供应商') AS VENDOR, "
+            "COALESCE(SUM(p.ORDERQTY), 0) AS ordered_qty "
+            "FROM poline p JOIN po ON po.PONUM = p.PONUM AND po.SITEID = p.SITEID "
+            f"WHERE {ordered_where} GROUP BY VENDOR ORDER BY ordered_qty DESC",
+            ordered_params, limit=20,
+        )
+        received_by_vendor: dict[str, float] = {}
+        if ordered_suppliers:
+            vendors = [str(row["VENDOR"]) for row in ordered_suppliers]
+            placeholders = ",".join(["%s"] * len(vendors))
+            for row in self.client.fetch_all(
+                    "SELECT COALESCE(NULLIF(po.VENDOR, ''), '未填供应商') AS VENDOR, "
+                    "COALESCE(SUM(m.QUANTITY), 0) AS received_qty "
+                    "FROM matrectrans m JOIN po ON po.PONUM = m.PONUM "
+                    f"WHERE {received_where} AND m.PONUM IS NOT NULL AND m.PONUM <> '' "
+                    f"AND COALESCE(NULLIF(po.VENDOR, ''), '未填供应商') IN ({placeholders}) "
+                    "GROUP BY VENDOR",
+                    [*received_params, *vendors], limit=len(vendors) or 1):
+                received_by_vendor[str(row["VENDOR"])] = float(row.get("received_qty") or 0)
+        by_supplier = [{
+            "VENDOR": str(row["VENDOR"]),
+            "ordered_qty": round(float(row["ordered_qty"] or 0), 2),
+            "received_qty": round(received_by_vendor.get(str(row["VENDOR"]), 0.0), 2),
+            "rate": _rate(received_by_vendor.get(str(row["VENDOR"]), 0.0), float(row["ordered_qty"] or 0)),
+        } for row in ordered_suppliers]
 
         return {
             "itemnum": itemnum,
             "supplier": supplier,
             "start": str(start) if start else None,
             "end": str(end) if end else None,
-            "window_applied": window_applied,
-            "contract_lines": int(totals.get("contract_lines") or 0),
-            "total_ordered": round(ordered, 2),
-            "total_received": round(received, 2),
-            "overall_rate": _rate(received, ordered),
-            "by_month": _with_rate(by_month),
-            "by_supplier": _with_rate(by_supplier),
-            "by_item": _with_rate(by_item),
-            "formula_explanation": "到货率 = 已入库数量 / 合同数量（数量口径，仅统计有效合同；入库按 matrectrans 接收流水核销，退库负数冲减）",
+            "window_applied": bool(start or end),
+            "contracts": contracts,
+            "total_ordered": round(ordered_total, 2),
+            "total_received": round(received_total, 2),
+            "overall_rate": _rate(received_total, ordered_total),
+            "by_item": by_item,
+            "by_supplier": by_supplier,
+            "formula_explanation": "到货率 = 已入库数量 / 合同数量（数量口径，仅有效合同；入库按 matrectrans 接收流水汇总，退库负数冲减；企业 ERP 的入库流水与合同行无行级关联，故按物资/供应商各自汇总后比较）",
         }
 
     def lead_time(self, itemnum: str | None = None, supplier: str | None = None) -> dict[str, Any] | None:

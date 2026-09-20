@@ -84,11 +84,19 @@ def test_chat_arrival_rate_degrades_when_erp_down(monkeypatch) -> None:
 
 def test_arrival_facts_formatting() -> None:
     facts = format_tool_facts("query_arrival_rate", {
-        "overall_rate": 0.8, "contract_lines": 5, "total_ordered": 100, "total_received": 80,
-        "by_month": [{"MONTH": "2026-08", "rate": 0.5}], "by_supplier": [{"VENDOR": "甲", "rate": 1.0}],
+        "overall_rate": 0.8, "contracts": 5, "total_ordered": 100, "total_received": 80,
+        "by_item": [{"ITEMNUM": "20002183", "rate": 0.6}],
+        "by_supplier": [{"VENDOR": "甲", "rate": 1.0}],
         "formula_explanation": "口径说明",
     })
     assert "80.0%" in facts and "甲" in facts
+    assert "全部历史" in facts and "5 份合同" in facts
+    windowed = format_tool_facts("query_arrival_rate", {
+        "overall_rate": 0.5, "contracts": 2, "total_ordered": 10, "total_received": 5,
+        "by_item": [], "by_supplier": [], "start": "2024-01-01", "end": "2024-12-31",
+        "window_applied": True,
+    })
+    assert "2024-01-01 ~ 2024-12-31" in windowed
     none_facts = format_tool_facts("query_arrival_rate", {"overall_rate": None, "by_month": [], "by_supplier": []})
     assert "无法计算" in none_facts
     stats = format_tool_facts("query_inventory_stats", {

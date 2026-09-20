@@ -56,6 +56,20 @@ def test_transfer_signal_in_other_warehouse_only_counts():
     assert result.suggestion in {RETURN, SCRAP}
 
 
+def test_transfer_basis_never_renders_raw_dirty_id():
+    """回归：ERP 的 matusetrans.STORELOC 存在 '{}' 等脏值，曾被直接渲染进建议文案。"""
+    result = classify_disposal(_row(has_transfer_demand=True, demand_warehouse="{}"), TODAY)
+    assert result.suggestion == TRANSFER
+    assert "{}" not in result.basis
+    assert "其他仓库" in result.basis
+
+
+def test_transfer_basis_falls_back_when_warehouse_blank():
+    result = classify_disposal(_row(has_transfer_demand=True, demand_warehouse="   "), TODAY)
+    assert result.suggestion == TRANSFER
+    assert result.basis.startswith("其他仓库")
+
+
 def test_amount_calculation():
     result = classify_disposal(_row(available_quantity=3, unit_cost=0.5), TODAY)
     assert result.amount == 1.5
